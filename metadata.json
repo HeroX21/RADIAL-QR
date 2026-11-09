@@ -1,0 +1,8 @@
+{
+  "name": "RADIAL QR",
+  "description": "Decode Beyond the Square — Next-generation artistic QR generator & custom radial code scanner with real polar geometry and Reed-Solomon decoding.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
