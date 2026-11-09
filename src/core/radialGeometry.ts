@@ -5,11 +5,12 @@
  */
 
 export interface RadialGridConfig {
-  ringCount: number;      // e.g. 14 to 20 concentric rings
-  sectorCount: number;    // e.g. 48 or 60 sectors per ring
+  ringCount: number;      // e.g. 14 to 24 concentric rings
+  sectorCount: number;    // e.g. 36 to 72 sectors per ring
   innerRadiusRatio: number; // e.g. 0.22 (center anchor zone)
   outerRadiusRatio: number; // e.g. 0.95 (quiet zone margin)
   maskPattern: number;
+  spiralFactor?: number;  // 0 for concentric, ~0.8 for spiral flow
 }
 
 export const DEFAULT_GRID_CONFIG: RadialGridConfig = {
@@ -18,6 +19,7 @@ export const DEFAULT_GRID_CONFIG: RadialGridConfig = {
   innerRadiusRatio: 0.22,
   outerRadiusRatio: 0.96,
   maskPattern: 0,
+  spiralFactor: 0,
 };
 
 export enum CellType {
@@ -27,6 +29,57 @@ export enum CellType {
   ANCHOR = 'ANCHOR',
   BOUNDARY = 'BOUNDARY',
 }
+
+/**
+ * Calculate total available data bits and total byte capacity for given grid dimensions
+ */
+export function calculateGridCapacity(ringCount: number, sectorCount: number): {
+  totalCells: number;
+  reservedCells: number;
+  dataBits: number;
+  dataBytes: number;
+} {
+  const totalCells = ringCount * sectorCount;
+  // Reserved: Ring 0 (clock = sectorCount) + Ring ringCount - 1 (boundary = sectorCount) + 15 fiducial cells
+  const reservedCells = 2 * sectorCount + 15;
+  const dataBits = Math.max(0, totalCells - reservedCells);
+  const dataBytes = Math.floor(dataBits / 8);
+  return {
+    totalCells,
+    reservedCells,
+    dataBits,
+    dataBytes,
+  };
+}
+
+/**
+ * Standard grid dimension tiers that maintain aesthetic radial proportions (sectors ~ 3x to 3.5x rings)
+ */
+export const STANDARD_GRID_TIERS: { ringCount: number; sectorCount: number; dataBytes: number }[] = [
+  { ringCount: 14, sectorCount: 44, dataBytes: 64 },
+  { ringCount: 16, sectorCount: 48, dataBytes: 82 },
+  { ringCount: 18, sectorCount: 54, dataBytes: 106 },
+  { ringCount: 20, sectorCount: 60, dataBytes: 133 },
+  { ringCount: 22, sectorCount: 64, dataBytes: 158 },
+  { ringCount: 24, sectorCount: 72, dataBytes: 196 },
+  { ringCount: 26, sectorCount: 80, dataBytes: 238 },
+];
+
+/**
+ * Recommend optimal grid dimensions for a required number of data bytes
+ */
+export function getRecommendedGridDimensions(
+  requiredBytes: number
+): { ringCount: number; sectorCount: number; maxBytes: number } {
+  for (const tier of STANDARD_GRID_TIERS) {
+    if (tier.dataBytes >= requiredBytes) {
+      return { ringCount: tier.ringCount, sectorCount: tier.sectorCount, maxBytes: tier.dataBytes };
+    }
+  }
+  const maxTier = STANDARD_GRID_TIERS[STANDARD_GRID_TIERS.length - 1];
+  return { ringCount: maxTier.ringCount, sectorCount: maxTier.sectorCount, maxBytes: maxTier.dataBytes };
+}
+
 
 export interface RadialCell {
   ring: number;
@@ -51,7 +104,7 @@ export function getCellType(ring: number, sector: number, ringCount: number, sec
   }
 
   // Asymmetric Orientation Fiducial:
-  // Located at sector 0..3 and sectors (sectorCount - 2)..(sectorCount - 1) on rings 1, 2, 3
+  // Located at sector 0..2 and sectors (sectorCount - 2)..(sectorCount - 1) on rings 1, 2, 3
   const isFiducialSector = sector <= 2 || sector >= sectorCount - 2;
   const isFiducialRing = ring >= 1 && ring <= 3;
   if (isFiducialRing && isFiducialSector) {
@@ -95,6 +148,7 @@ export function buildRadialMatrix(
   cells: RadialCell[][];
   totalDataCapacity: number;
   bitsUsed: number;
+  hasOverflow: boolean;
   config: RadialGridConfig;
 } {
   const { ringCount, sectorCount, maskPattern } = config;
@@ -154,6 +208,7 @@ export function buildRadialMatrix(
     cells,
     totalDataCapacity,
     bitsUsed: Math.min(dataBitIndex, bits.length),
+    hasOverflow: bits.length > totalDataCapacity,
     config,
   };
 }
@@ -195,7 +250,8 @@ export function extractBitsFromRadialMatrix(
 
 /**
  * Polar coordinate calculation:
- * Returns center of cell (ring, sector) in normalized canvas coordinates [0..size]
+ * Returns center of cell (ring, sector) in normalized canvas coordinates [0..size].
+ * Supports spiralOffset exclusively on DATA cells; structural cells remain strictly concentric.
  */
 export function getCellCenterPolar(
   ring: number,
@@ -206,16 +262,24 @@ export function getCellCenterPolar(
   centerY: number,
   innerRadius: number,
   outerRadius: number,
-  rotationAngle = 0
+  rotationAngle = 0,
+  spiralFactor = 0
 ): { x: number; y: number; radius: number; angle: number; ringThickness: number; sectorSpan: number } {
   const ringThickness = (outerRadius - innerRadius) / ringCount;
   const radius = innerRadius + (ring + 0.5) * ringThickness;
   const sectorSpan = (2 * Math.PI) / sectorCount;
+
+  const cellType = getCellType(ring, sector, ringCount, sectorCount);
+  const spiralOffset = (cellType === CellType.DATA && spiralFactor !== 0)
+    ? (ring / ringCount) * spiralFactor
+    : 0;
+
   // Offset by rotation angle, top is -PI/2
-  const angle = (sector * sectorSpan) - Math.PI / 2 + rotationAngle;
+  const angle = (sector * sectorSpan) - Math.PI / 2 + rotationAngle + spiralOffset;
 
   const x = centerX + radius * Math.cos(angle);
   const y = centerY + radius * Math.sin(angle);
 
   return { x, y, radius, angle, ringThickness, sectorSpan };
 }
+

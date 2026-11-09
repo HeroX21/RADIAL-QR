@@ -30,6 +30,7 @@ export interface RadialStyleOptions {
   rotation: number;           // in degrees (0..360)
   density: number;            // 0.5 .. 1.0 (gap spacing)
   strokeWidth: number;        // in pixels
+  spiralFactor?: number;      // 0 for concentric, ~0.8 for spiral flow
   innerRadiusRatio: number;   // 0.15 .. 0.35
   outerRadiusRatio: number;   // 0.85 .. 0.98
   fgColor: string;            // hex/rgb
@@ -51,6 +52,7 @@ export const DEFAULT_STYLE_OPTIONS: RadialStyleOptions = {
   rotation: 0,
   density: 0.88,
   strokeWidth: 2,
+  spiralFactor: 0.8,
   innerRadiusRatio: 0.22,
   outerRadiusRatio: 0.94,
   fgColor: '#00C8FF',
@@ -64,6 +66,7 @@ export const DEFAULT_STYLE_OPTIONS: RadialStyleOptions = {
   borderStyle: 'ticks',
   showCalibrationGuides: false,
 };
+
 
 /**
  * Render Radial QR Code onto an HTML Canvas 2D Context
@@ -129,17 +132,21 @@ export function renderRadialToCanvas(
     const rInner = innerRadius + r * ringThickness;
     const rOuter = rInner + ringThickness;
 
-    // Spiral flow offset modifier
-    const spiralOffset = style.family === 'spiral-flow' ? (r / ringCount) * 1.2 : 0;
-
     for (let s = 0; s < sectorCount; s++) {
       const cell = cells[r][s];
       if (cell.value === 0 && cell.type !== CellType.FIDUCIAL) continue;
 
+      // Spiral flow offset only applies to DATA cells, never to structural markers!
+      const isDataCell = cell.type === CellType.DATA;
+      const spiralOffset = (style.family === 'spiral-flow' && isDataCell)
+        ? (r / ringCount) * (style.spiralFactor ?? 0.8)
+        : 0;
+
       const baseAngle = s * sectorSpan - Math.PI / 2 + rotRad + spiralOffset;
-      // Gap spacing by density
-      const angularGap = ((1 - style.density) * sectorSpan) / 2;
-      const radialGap = ((1 - style.density) * ringThickness) / 2;
+      const isStructural = cell.type !== CellType.DATA;
+      const effectiveDensity = isStructural ? 0.95 : style.density;
+      const angularGap = ((1 - effectiveDensity) * sectorSpan) / 2;
+      const radialGap = ((1 - effectiveDensity) * ringThickness) / 2;
 
       const aStart = baseAngle + angularGap;
       const aEnd = baseAngle + sectorSpan - angularGap;
@@ -149,7 +156,7 @@ export function renderRadialToCanvas(
       ctx.fillStyle = cellFillStyle;
       ctx.strokeStyle = cellFillStyle;
 
-      if (style.family === 'radial-angular' || style.family === 'concentric-rings') {
+      if (isStructural || style.family === 'radial-angular' || style.family === 'concentric-rings') {
         // Crisp angular segment arc
         drawArcWedge(ctx, cx, cy, rIn, rOut, aStart, aEnd, style.moduleShape);
       } else if (style.family === 'spiral-flow') {
@@ -160,13 +167,14 @@ export function renderRadialToCanvas(
         drawLabyrinthSegment(ctx, cx, cy, rIn, rOut, aStart, aEnd, r, s, cells);
       } else if (style.family === 'circuit-matrix') {
         // PCB circuit traces, tracks, and circular vias
-        drawCircuitSegment(ctx, cx, cy, rIn, rOut, aStart, aEnd, r, s);
+        drawCircuitSegment(ctx, cx, cy, rIn, rOut, aStart, aEnd, r, s, cells);
       } else if (style.family === 'abstract-hybrid') {
         // Faceted diamond cuts and multifaceted angular geometry
         drawFacetedSegment(ctx, cx, cy, rIn, rOut, aStart, aEnd, r, s);
       }
     }
   }
+
 
   // 2. Draw Center Anchor (Bullseye / Calibrator)
   if (style.showCenterAnchor) {
@@ -231,11 +239,9 @@ function drawSpiralSegment(
   aStart: number,
   aEnd: number
 ): void {
+  // Smoothly curved arc segment covering (rMid, aMid)
   ctx.beginPath();
   ctx.arc(cx, cy, rOuter, aStart, aEnd, false);
-  const endX = cx + rInner * Math.cos(aEnd);
-  const endY = cy + rInner * Math.sin(aEnd);
-  ctx.lineTo(endX, endY);
   ctx.arc(cx, cy, rInner, aEnd, aStart, true);
   ctx.closePath();
   ctx.fill();
@@ -256,9 +262,7 @@ function drawLabyrinthSegment(
   s: number,
   cells: RadialCell[][]
 ): void {
-  const rMid = (rInner + rOuter) / 2;
-  const aMid = (aStart + aEnd) / 2;
-
+  // Main corridor arc
   ctx.beginPath();
   ctx.arc(cx, cy, rOuter, aStart, aEnd, false);
   ctx.arc(cx, cy, rInner, aEnd, aStart, true);
@@ -287,26 +291,40 @@ function drawCircuitSegment(
   aStart: number,
   aEnd: number,
   r: number,
-  s: number
+  s: number,
+  cells: RadialCell[][]
 ): void {
   const rMid = (rInner + rOuter) / 2;
   const aMid = (aStart + aEnd) / 2;
-  const traceWidth = Math.max(2, (rOuter - rInner) * 0.45);
+  const xMid = cx + rMid * Math.cos(aMid);
+  const yMid = cy + rMid * Math.sin(aMid);
+  const cellHeight = rOuter - rInner;
+  const traceWidth = Math.max(2.5, cellHeight * 0.42);
 
+  // 1. Draw solid circular via pad at exact sampling center (xMid, yMid)
+  const viaRadius = Math.max(3, cellHeight * 0.4);
+  ctx.beginPath();
+  ctx.arc(xMid, yMid, viaRadius, 0, Math.PI * 2);
+  ctx.fill();
+
+  // 2. Arc circuit trace connecting along sector
   ctx.beginPath();
   ctx.lineWidth = traceWidth;
   ctx.arc(cx, cy, rMid, aStart, aEnd, false);
   ctx.stroke();
 
-  // Terminal via node (small circular pad at sector ends)
-  if (s % 3 === 0) {
-    const xNode = cx + rMid * Math.cos(aMid);
-    const yNode = cy + rMid * Math.sin(aMid);
+  // 3. Radial spur connecting to adjacent active inner cell
+  if (r > 0 && cells[r - 1]?.[s]?.value === 1) {
     ctx.beginPath();
-    ctx.arc(xNode, yNode, traceWidth * 0.9, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.lineWidth = traceWidth * 0.8;
+    ctx.moveTo(xMid, yMid);
+    const xIn = cx + rInner * Math.cos(aMid);
+    const yIn = cy + rInner * Math.sin(aMid);
+    ctx.lineTo(xIn, yIn);
+    ctx.stroke();
   }
 }
+
 
 /**
  * Draw faceted diamond and polygon cuts for Abstract Hybrid
@@ -537,15 +555,21 @@ export function generateRadialSvg(
   for (let r = 0; r < ringCount; r++) {
     const rInner = innerRadius + r * ringThickness;
     const rOuter = rInner + ringThickness;
-    const spiralOffset = style.family === 'spiral-flow' ? (r / ringCount) * 1.2 : 0;
-
     for (let s = 0; s < sectorCount; s++) {
       const cell = cells[r][s];
       if (cell.value === 0 && cell.type !== CellType.FIDUCIAL) continue;
 
+      const isDataCell = cell.type === CellType.DATA;
+      const spiralOffset = (style.family === 'spiral-flow' && isDataCell)
+        ? (r / ringCount) * (style.spiralFactor ?? 0.8)
+        : 0;
+
       const baseAngle = s * sectorSpan - Math.PI / 2 + rotRad + spiralOffset;
-      const angularGap = ((1 - style.density) * sectorSpan) / 2;
-      const radialGap = ((1 - style.density) * ringThickness) / 2;
+      const isStructural = cell.type !== CellType.DATA;
+      const effectiveDensity = isStructural ? 0.95 : style.density;
+      const angularGap = ((1 - effectiveDensity) * sectorSpan) / 2;
+      const radialGap = ((1 - effectiveDensity) * ringThickness) / 2;
+
 
       const aStart = baseAngle + angularGap;
       const aEnd = baseAngle + sectorSpan - angularGap;

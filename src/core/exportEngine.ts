@@ -7,7 +7,7 @@
 import { jsPDF } from 'jspdf';
 import { renderRadialToCanvas, generateRadialSvg, RadialStyleOptions } from './radialRenderer';
 import { renderStandardQrToCanvas, generateStandardQrSvg, StandardQrOptions, validateStandardQrDecoding } from './standardQrEngine';
-import { RqrEncodedResult } from './rqrProtocol';
+import { RqrEncodedResult, RqrDiagnosticStatus } from './rqrProtocol';
 import { decodeRadialImageData } from './radialDecoder';
 
 export type ExportFormat = 'png' | 'svg' | 'pdf';
@@ -15,6 +15,7 @@ export type ExportResolution = 512 | 1024 | 2048 | 4096;
 
 export interface ValidationReport {
   isVerified: boolean;
+  status: RqrDiagnosticStatus;
   format: 'radial' | 'standard';
   originalPayload: string;
   decodedPayload?: string;
@@ -40,6 +41,7 @@ export async function verifyRenderedCode(
   if (!ctx) {
     return {
       isVerified: false,
+      status: RqrDiagnosticStatus.DECODING_FAILED,
       format: mode,
       originalPayload: payload,
       error: 'Canvas 2D context unavailable',
@@ -47,12 +49,28 @@ export async function verifyRenderedCode(
   }
 
   if (mode === 'radial' && radialData) {
+    // Check if the encoded packet has capacity overflow
+    if (radialData.encoded.hasOverflow) {
+      return {
+        isVerified: false,
+        status: RqrDiagnosticStatus.INSUFFICIENT_CAPACITY,
+        format: 'radial',
+        originalPayload: payload,
+        error: `Payload size (${radialData.encoded.requiredBytes} bytes) exceeds current grid capacity (${radialData.encoded.availableCapacityBytes} bytes)`,
+      };
+    }
+
     renderRadialToCanvas(ctx, radialData.encoded, size, radialData.style);
     const imgData = ctx.getImageData(0, 0, size, size);
+    const spiralFactor = radialData.style.family === 'spiral-flow'
+      ? (radialData.style.spiralFactor ?? 0.8)
+      : 0;
+
     const result = decodeRadialImageData(imgData, {
       ringCount: radialData.encoded.packet.header.ringCount,
       sectorCount: radialData.encoded.packet.header.sectorCount,
       maskPattern: radialData.encoded.packet.header.maskPattern,
+      spiralFactor,
       innerRadiusRatio: radialData.style.innerRadiusRatio,
       outerRadiusRatio: radialData.style.outerRadiusRatio,
     });
@@ -60,6 +78,7 @@ export async function verifyRenderedCode(
     const isMatch = result.success && result.text === payload;
     return {
       isVerified: isMatch,
+      status: isMatch ? RqrDiagnosticStatus.VALIDATED : result.status,
       format: 'radial',
       originalPayload: payload,
       decodedPayload: result.text,
@@ -71,6 +90,7 @@ export async function verifyRenderedCode(
     const val = validateStandardQrDecoding(testCanvas, payload);
     return {
       isVerified: val.isValid,
+      status: val.isValid ? RqrDiagnosticStatus.VALIDATED : RqrDiagnosticStatus.DECODING_FAILED,
       format: 'standard',
       originalPayload: payload,
       decodedPayload: val.decodedPayload,
@@ -81,11 +101,13 @@ export async function verifyRenderedCode(
 
   return {
     isVerified: false,
+    status: RqrDiagnosticStatus.DECODING_FAILED,
     format: mode,
     originalPayload: payload,
     error: 'Missing rendering parameters',
   };
 }
+
 
 /**
  * Export high-resolution PNG

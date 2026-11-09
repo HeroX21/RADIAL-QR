@@ -5,7 +5,7 @@
  */
 
 import { DEFAULT_GRID_CONFIG, RadialGridConfig, extractBitsFromRadialMatrix, getCellType, CellType } from './radialGeometry';
-import { decodeRqrCodeword, RqrPacket } from './rqrProtocol';
+import { decodeRqrCodeword, RqrPacket, RqrDiagnosticStatus } from './rqrProtocol';
 
 export interface RadialDecodeDiagnostics {
   center: { x: number; y: number };
@@ -18,6 +18,7 @@ export interface RadialDecodeDiagnostics {
   samplingPoints: { x: number; y: number; value: number }[];
   isDarkOnLight: boolean;
   errorsCorrected: number;
+  spiralFactorDetected?: number;
 }
 
 export interface RadialDecodeResult {
@@ -25,8 +26,10 @@ export interface RadialDecodeResult {
   packet?: RqrPacket;
   text?: string;
   diagnostics?: RadialDecodeDiagnostics;
+  status: RqrDiagnosticStatus;
   errorMessage?: string;
 }
+
 
 /**
  * Main decoding entrypoint taking ImageData
@@ -40,7 +43,11 @@ export function decodeRadialImageData(
   const data = imageData.data;
 
   if (width < 64 || height < 64) {
-    return { success: false, errorMessage: "Image resolution too small for radial decoding" };
+    return {
+      success: false,
+      status: RqrDiagnosticStatus.LOW_MODULE_RESOLUTION,
+      errorMessage: "Image resolution too small for radial decoding",
+    };
   }
 
   // 1. Convert to Grayscale & compute statistics
@@ -60,18 +67,24 @@ export function decodeRadialImageData(
 
   const contrast = maxLum - minLum;
   if (contrast < 20) {
-    return { success: false, errorMessage: "Image contrast too low to detect radial pattern" };
+    return {
+      success: false,
+      status: RqrDiagnosticStatus.STRUCTURAL_MARKER_ERROR,
+      errorMessage: "Image contrast too low to detect radial pattern",
+    };
   }
 
   // Global threshold (Otsu approximation)
   const threshold = Math.round(minLum + contrast * 0.5);
 
   // 2. Find Symbol Center Anchor
-  // Most scans are centered or viewfinder-guided.
-  // Search in center bounding box for central circular anchor
   const centerResult = locateCenterAnchor(gray, width, height, threshold);
   if (!centerResult) {
-    return { success: false, errorMessage: "Could not find radial central anchor" };
+    return {
+      success: false,
+      status: RqrDiagnosticStatus.STRUCTURAL_MARKER_ERROR,
+      errorMessage: "Could not find radial central anchor",
+    };
   }
   const { cx, cy, anchorRadius, isDarkOnLight } = centerResult;
 
@@ -82,19 +95,25 @@ export function decodeRadialImageData(
     : estimatedOuterRadius;
 
   if (outerRadius <= anchorRadius * 1.5) {
-    return { success: false, errorMessage: "Invalid radial symbol dimensions detected" };
+    return {
+      success: false,
+      status: RqrDiagnosticStatus.STRUCTURAL_MARKER_ERROR,
+      errorMessage: "Invalid radial symbol dimensions detected",
+    };
   }
 
   const innerRadius = customConfig?.innerRadiusRatio
     ? (Math.min(width, height) / 2) * customConfig.innerRadiusRatio
     : anchorRadius * 1.05;
 
-  // 4. Test candidate configurations (default: 16 rings, 48 sectors; or custom)
-  const candidateRingCounts = customConfig?.ringCount ? [customConfig.ringCount] : [16, 14, 18, 12, 20];
-  const candidateSectorCounts = customConfig?.sectorCount ? [customConfig.sectorCount] : [48, 60, 36, 64];
+  // 4. Candidate configurations
+  const candidateRingCounts = customConfig?.ringCount ? [customConfig.ringCount] : [16, 18, 20, 22, 14, 24];
+  const candidateSectorCounts = customConfig?.sectorCount ? [customConfig.sectorCount] : [48, 54, 60, 64, 72, 44];
+  const candidateSpiralFactors = customConfig?.spiralFactor !== undefined
+    ? [customConfig.spiralFactor]
+    : [0, 0.8];
 
-  // 5. Detect Symbol Orientation Angle (0 to 2*PI)
-  // Scan angular profile around the fiducial ring track
+  // 5. Detect Symbol Orientation Angle
   const orientationAngle = detectOrientationAngle(
     gray,
     width,
@@ -107,7 +126,10 @@ export function decodeRadialImageData(
     isDarkOnLight
   );
 
-  // Try candidate grid geometries
+  let lastStatus = RqrDiagnosticStatus.DECODING_FAILED;
+  let lastError = "Found radial symbol structure but could not decode valid RQR1 packet";
+
+  // Try candidate grid geometries and spiral factors
   for (const ringCount of candidateRingCounts) {
     for (const sectorCount of candidateSectorCounts) {
       const sectorSpan = (2 * Math.PI) / sectorCount;
@@ -119,60 +141,70 @@ export function decodeRadialImageData(
         orientationAngle - sectorSpan * 0.5,
       ];
 
-      for (const angleCandidate of candidateAngles) {
-        const config: RadialGridConfig = {
-          ringCount,
-          sectorCount,
-          innerRadiusRatio: innerRadius / outerRadius,
-          outerRadiusRatio: 1.0,
-          maskPattern: customConfig?.maskPattern ?? 0,
-        };
+      for (const spiralFactor of candidateSpiralFactors) {
+        for (const angleCandidate of candidateAngles) {
+          const config: RadialGridConfig = {
+            ringCount,
+            sectorCount,
+            innerRadiusRatio: innerRadius / outerRadius,
+            outerRadiusRatio: 1.0,
+            maskPattern: customConfig?.maskPattern ?? 0,
+            spiralFactor,
+          };
 
-        // Sample cells at polar coordinates
-        const { sampledMatrix, samplingPoints, signalConfidence } = samplePolarGrid(
-          gray,
-          width,
-          height,
-          cx,
-          cy,
-          innerRadius,
-          outerRadius,
-          angleCandidate,
-          config,
-          threshold,
-          isDarkOnLight
-        );
+          // Sample cells at polar coordinates
+          const { sampledMatrix, samplingPoints, signalConfidence } = samplePolarGrid(
+            gray,
+            width,
+            height,
+            cx,
+            cy,
+            innerRadius,
+            outerRadius,
+            angleCandidate,
+            config,
+            threshold,
+            isDarkOnLight
+          );
 
-        // Try each mask pattern (0..3) if not explicitly fixed
-        const maskPatterns = customConfig?.maskPattern !== undefined
-          ? [customConfig.maskPattern]
-          : [0, 1, 2, 3];
+          // Try each mask pattern (0..3) if not explicitly fixed
+          const maskPatterns = customConfig?.maskPattern !== undefined
+            ? [customConfig.maskPattern]
+            : [0, 1, 2, 3];
 
-        for (const mask of maskPatterns) {
-          config.maskPattern = mask;
-          const rawBytes = extractBitsFromRadialMatrix(sampledMatrix, config);
-          const decodeResult = decodeRqrCodeword(rawBytes);
+          for (const mask of maskPatterns) {
+            config.maskPattern = mask;
+            const rawBytes = extractBitsFromRadialMatrix(sampledMatrix, config);
+            const decodeResult = decodeRqrCodeword(rawBytes);
 
-          if (decodeResult.success && decodeResult.packet) {
-            const diagnostics: RadialDecodeDiagnostics = {
-              center: { x: Math.round(cx), y: Math.round(cy) },
-              outerRadius: Math.round(outerRadius),
-              innerRadius: Math.round(innerRadius),
-              orientationAngle: angleCandidate,
-              confidence: Math.min(1.0, signalConfidence + (decodeResult.errorsCorrected === 0 ? 0.3 : 0.1)),
-              ringsDetected: ringCount,
-              sectorsDetected: sectorCount,
-              samplingPoints: samplingPoints.slice(0, 120),
-              isDarkOnLight,
-              errorsCorrected: decodeResult.errorsCorrected,
-            };
+            if (decodeResult.success && decodeResult.packet) {
+              const diagnostics: RadialDecodeDiagnostics = {
+                center: { x: Math.round(cx), y: Math.round(cy) },
+                outerRadius: Math.round(outerRadius),
+                innerRadius: Math.round(innerRadius),
+                orientationAngle: angleCandidate,
+                confidence: Math.min(1.0, signalConfidence + (decodeResult.errorsCorrected === 0 ? 0.3 : 0.1)),
+                ringsDetected: ringCount,
+                sectorsDetected: sectorCount,
+                samplingPoints: samplingPoints.slice(0, 120),
+                isDarkOnLight,
+                errorsCorrected: decodeResult.errorsCorrected,
+                spiralFactorDetected: spiralFactor,
+              };
 
-            return {
-              success: true,
-              packet: decodeResult.packet,
-              text: decodeResult.packet.payload,
-              diagnostics,
-            };
+              return {
+                success: true,
+                packet: decodeResult.packet,
+                text: decodeResult.packet.payload,
+                status: RqrDiagnosticStatus.VALIDATED,
+                diagnostics,
+              };
+            } else if (decodeResult.status) {
+              lastStatus = decodeResult.status;
+              if (decodeResult.errorReason) {
+                lastError = decodeResult.errorReason;
+              }
+            }
           }
         }
       }
@@ -181,21 +213,23 @@ export function decodeRadialImageData(
 
   return {
     success: false,
-    errorMessage: "Found radial symbol structure but could not decode valid RQR1 packet",
+    status: lastStatus,
+    errorMessage: lastError,
     diagnostics: {
       center: { x: Math.round(cx), y: Math.round(cy) },
       outerRadius: Math.round(outerRadius),
       innerRadius: Math.round(innerRadius),
       orientationAngle,
       confidence: 0.35,
-      ringsDetected: 16,
-      sectorsDetected: 48,
+      ringsDetected: candidateRingCounts[0] ?? 16,
+      sectorsDetected: candidateSectorCounts[0] ?? 48,
       samplingPoints: [],
       isDarkOnLight,
       errorsCorrected: 0,
     },
   };
 }
+
 
 /**
  * Locate center circular anchor
@@ -421,9 +455,16 @@ function samplePolarGrid(
     const radius = innerRadius + (r + 0.5) * ringThickness;
 
     for (let s = 0; s < sectorCount; s++) {
-      const angle = (s + 0.5) * sectorSpan - Math.PI / 2 + orientationAngle;
+      const cellType = getCellType(r, s, ringCount, sectorCount);
+      const isDataCell = cellType === CellType.DATA;
+      const spiralOffset = (isDataCell && (config.spiralFactor ?? 0) !== 0)
+        ? (r / ringCount) * config.spiralFactor!
+        : 0;
+
+      const angle = (s + 0.5) * sectorSpan - Math.PI / 2 + orientationAngle + spiralOffset;
       const sampleX = cx + radius * Math.cos(angle);
       const sampleY = cy + radius * Math.sin(angle);
+
 
       // 5-point cross sampling for noise immunity
       let sampleSum = 0;

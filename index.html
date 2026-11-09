@@ -3,7 +3,37 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      (function() {
+        try {
+          var origFetch = window.fetch ? window.fetch.bind(window) : null;
+          var activeFetch = origFetch;
+          Object.defineProperty(window, 'fetch', {
+            configurable: true,
+            enumerable: true,
+            get: function() {
+              return activeFetch;
+            },
+            set: function(fn) {
+              activeFetch = fn;
+            }
+          });
+        } catch (_) {}
+
+        window.addEventListener('error', function(event) {
+          if (
+            (event.filename && event.filename.indexOf('chrome-extension://') !== -1) ||
+            (event.message && event.message.indexOf('Cannot set property fetch') !== -1)
+          ) {
+            if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+            if (typeof event.preventDefault === 'function') event.preventDefault();
+            return true;
+          }
+        }, true);
+      })();
+    </script>
     <title>RADIAL QR — Decode Beyond the Square</title>
+
     <meta name="description" content="Decode Beyond the Square — Next-generation artistic QR generator & custom radial code scanner with real polar geometry and Reed-Solomon decoding." />
     <meta property="og:title" content="RADIAL QR — Decode Beyond the Square" />
     <meta property="og:description" content="Decode Beyond the Square — Next-generation artistic QR generator & custom radial code scanner with real polar geometry and Reed-Solomon decoding." />

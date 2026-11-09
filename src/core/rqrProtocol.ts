@@ -6,6 +6,7 @@
 
 import { computeCRC32, crc32ToBytes, bytesToCRC32 } from './crc32';
 import { encodeRS, decodeRS } from './reedsolomon';
+import { calculateGridCapacity } from './radialGeometry';
 
 export const RQR_MAGIC = new Uint8Array([0x52, 0x51, 0x52, 0x31]); // "RQR1"
 export const RQR_VERSION = 1;
@@ -35,6 +36,16 @@ export const ECC_LENGTHS: Record<EccLevel, number> = {
   [EccLevel.HIGH]: 24,
 };
 
+export enum RqrDiagnosticStatus {
+  VALIDATED = 'VALIDATED',
+  INSUFFICIENT_CAPACITY = 'INSUFFICIENT CAPACITY',
+  LOW_MODULE_RESOLUTION = 'LOW MODULE RESOLUTION',
+  STRUCTURAL_MARKER_ERROR = 'STRUCTURAL MARKER ERROR',
+  ERROR_CORRECTION_FAILED = 'ERROR CORRECTION FAILED',
+  CHECKSUM_FAILED = 'CHECKSUM FAILED',
+  DECODING_FAILED = 'DECODING FAILED',
+}
+
 export interface RqrPacketHeader {
   version: number;
   payloadType: PayloadType;
@@ -56,7 +67,11 @@ export interface RqrEncodedResult {
   totalBytes: number;
   packet: RqrPacket;
   crcMatch: boolean;
+  hasOverflow?: boolean;
+  requiredBytes?: number;
+  availableCapacityBytes?: number;
 }
+
 
 /**
  * Serialize an RQR1 packet into a protected binary codeword stream
@@ -69,6 +84,7 @@ export function encodeRqrPacket(
     sectorCount?: number;
     maskPattern?: number;
     eccLevel?: EccLevel;
+    padToGridCapacity?: boolean;
   } = {}
 ): RqrEncodedResult & { codeword: Uint8Array } {
   const version = RQR_VERSION;
@@ -77,6 +93,7 @@ export function encodeRqrPacket(
   const maskPattern = options.maskPattern ?? 0;
   const eccLevel = options.eccLevel ?? EccLevel.MEDIUM;
   const eccLen = ECC_LENGTHS[eccLevel];
+  const padToGrid = options.padToGridCapacity !== false;
 
   const encoder = new TextEncoder();
   const payloadBytes = encoder.encode(payload);
@@ -110,56 +127,31 @@ export function encodeRqrPacket(
   const crc = computeCRC32(unchecksummed);
   const crcBytes = crc32ToBytes(crc);
 
-  // Raw data packet = unchecksummed + 4 bytes CRC
-  const rawPacket = new Uint8Array(unchecksummedLen + 4);
-  rawPacket.set(unchecksummed, 0);
-  rawPacket.set(crcBytes, unchecksummedLen);
+  // Base data packet: unchecksummed + 4 bytes CRC
+  const minDataLen = unchecksummedLen + 4;
+  const gridCap = calculateGridCapacity(ringCount, sectorCount);
+  const targetCodewordBytes = gridCap.dataBytes;
+  const targetDataBytes = Math.max(minDataLen, targetCodewordBytes - eccLen);
 
-  // Protect raw packet with Reed-Solomon codewords
-  // If packet is large, we interleave across blocks of max size (e.g. 110 data bytes)
-  const maxBlockData = 100;
-  let codeword: Uint8Array;
+  const hasOverflow = minDataLen + eccLen > targetCodewordBytes;
 
-  if (rawPacket.length <= maxBlockData) {
-    // Single block
-    codeword = encodeRS(rawPacket, eccLen);
+  let dataBlock: Uint8Array;
+  if (padToGrid && targetDataBytes >= minDataLen) {
+    dataBlock = new Uint8Array(targetDataBytes);
+    dataBlock.set(unchecksummed, 0);
+    dataBlock.set(crcBytes, unchecksummedLen);
+    // Pad remainder with alternating 0xEC, 0x11 (standard QR padding bytes)
+    for (let i = minDataLen; i < targetDataBytes; i++) {
+      dataBlock[i] = (i - minDataLen) % 2 === 0 ? 0xEC : 0x11;
+    }
   } else {
-    // Multi-block interleaving
-    const numBlocks = Math.ceil(rawPacket.length / maxBlockData);
-    const blocks: Uint8Array[] = [];
-    const blockEcc: Uint8Array[] = [];
-
-    for (let b = 0; b < numBlocks; b++) {
-      const start = b * maxBlockData;
-      const end = Math.min(rawPacket.length, (b + 1) * maxBlockData);
-      const chunk = rawPacket.slice(start, end);
-      const encodedChunk = encodeRS(chunk, eccLen);
-      blocks.push(chunk);
-      blockEcc.push(encodedChunk.slice(chunk.length));
-    }
-
-    // Interleave data bytes, then interleave ECC bytes
-    const totalLen = rawPacket.length + numBlocks * eccLen;
-    codeword = new Uint8Array(totalLen);
-    let outIdx = 0;
-
-    // Interleave data
-    const maxDataLen = Math.max(...blocks.map((b) => b.length));
-    for (let i = 0; i < maxDataLen; i++) {
-      for (let b = 0; b < numBlocks; b++) {
-        if (i < blocks[b].length) {
-          codeword[outIdx++] = blocks[b][i];
-        }
-      }
-    }
-
-    // Interleave ECC
-    for (let i = 0; i < eccLen; i++) {
-      for (let b = 0; b < numBlocks; b++) {
-        codeword[outIdx++] = blockEcc[b][i];
-      }
-    }
+    dataBlock = new Uint8Array(minDataLen);
+    dataBlock.set(unchecksummed, 0);
+    dataBlock.set(crcBytes, unchecksummedLen);
   }
+
+  // Single-block Reed-Solomon over dataBlock
+  const codeword = encodeRS(dataBlock, eccLen);
 
   // Convert bytes into bit array (MSB first)
   const bits = new Uint8Array(codeword.length * 8);
@@ -190,6 +182,9 @@ export function encodeRqrPacket(
     totalBytes: codeword.length,
     packet,
     crcMatch: true,
+    hasOverflow,
+    requiredBytes: minDataLen + eccLen,
+    availableCapacityBytes: targetCodewordBytes,
   };
 }
 
@@ -199,93 +194,130 @@ export function encodeRqrPacket(
 export function decodeRqrCodeword(
   rawBytes: Uint8Array,
   expectedEccLevel?: EccLevel
-): { success: boolean; packet?: RqrPacket; errorsCorrected: number; errorReason?: string } {
+): {
+  success: boolean;
+  packet?: RqrPacket;
+  errorsCorrected: number;
+  status: RqrDiagnosticStatus;
+  errorReason?: string;
+} {
   if (rawBytes.length < 16) {
-    return { success: false, errorsCorrected: 0, errorReason: "Data too short for RQR header" };
+    return {
+      success: false,
+      errorsCorrected: 0,
+      status: RqrDiagnosticStatus.DECODING_FAILED,
+      errorReason: 'Data too short for RQR header',
+    };
   }
 
-  // We check ECC lengths starting from candidate level or try standard levels
   const eccLevelsToTry = expectedEccLevel !== undefined
     ? [expectedEccLevel]
     : [EccLevel.MEDIUM, EccLevel.LOW, EccLevel.QUARTILE, EccLevel.HIGH];
 
-  let bestResult: { success: boolean; packet?: RqrPacket; errorsCorrected: number; errorReason?: string } = {
-    success: false,
-    errorsCorrected: 0,
-    errorReason: "Decoding failed",
-  };
+  let bestStatus = RqrDiagnosticStatus.DECODING_FAILED;
+  let bestError = 'Decoding failed';
+  let bestErrorsCorrected = 0;
 
   for (const level of eccLevelsToTry) {
     const eccLen = ECC_LENGTHS[level];
     if (rawBytes.length <= eccLen) continue;
 
-    // Single block RS decode attempt
-    const rsResult = decodeRS(rawBytes, eccLen);
-    if (!rsResult.success) continue;
+    const candidateBuffers: Uint8Array[] = [rawBytes];
 
-    const data = rsResult.data;
-    if (data.length < 16) continue;
-
-    // Check magic signature "RQR1"
+    // If rawBytes has uncorrupted header, also test exact sliced length
     if (
-      data[0] !== RQR_MAGIC[0] ||
-      data[1] !== RQR_MAGIC[1] ||
-      data[2] !== RQR_MAGIC[2] ||
-      data[3] !== RQR_MAGIC[3]
+      rawBytes[0] === RQR_MAGIC[0] &&
+      rawBytes[1] === RQR_MAGIC[1] &&
+      rawBytes[2] === RQR_MAGIC[2] &&
+      rawBytes[3] === RQR_MAGIC[3]
     ) {
-      continue;
+      const explicitPayloadLen = (rawBytes[10] << 8) | rawBytes[11];
+      const explicitCodewordLen = 12 + explicitPayloadLen + 4 + eccLen;
+      if (explicitCodewordLen > eccLen && explicitCodewordLen < rawBytes.length) {
+        candidateBuffers.push(rawBytes.slice(0, explicitCodewordLen));
+      }
     }
 
-    const version = data[4];
-    const payloadType = data[5] as PayloadType;
-    const ringCount = data[6];
-    const sectorCount = data[7];
-    const maskPattern = data[8];
-    const decodedEcc = data[9] as EccLevel;
-    const payloadLen = (data[10] << 8) | data[11];
+    for (const buf of candidateBuffers) {
+      const rsResult = decodeRS(buf, eccLen);
+      if (!rsResult.success) {
+        bestStatus = RqrDiagnosticStatus.ERROR_CORRECTION_FAILED;
+        bestError = 'Reed-Solomon error correction failed (exceeded correctable error budget)';
+        continue;
+      }
 
-    const expectedTotalLen = 12 + payloadLen + 4; // header + payload + CRC
-    if (data.length < expectedTotalLen) {
-      continue;
-    }
+      const data = rsResult.data;
+      if (data.length < 16) continue;
 
-    // Verify CRC32
-    const unchecksummed = data.slice(0, 12 + payloadLen);
-    const computedCrc = computeCRC32(unchecksummed);
-    const storedCrc = bytesToCRC32(data, 12 + payloadLen);
+      // Check magic signature "RQR1"
+      if (
+        data[0] !== RQR_MAGIC[0] ||
+        data[1] !== RQR_MAGIC[1] ||
+        data[2] !== RQR_MAGIC[2] ||
+        data[3] !== RQR_MAGIC[3]
+      ) {
+        bestStatus = RqrDiagnosticStatus.STRUCTURAL_MARKER_ERROR;
+        bestError = 'RQR1 signature magic header invalid';
+        continue;
+      }
 
-    if (computedCrc !== storedCrc) {
-      // CRC mismatch
-      bestResult = {
-        success: false,
-        errorsCorrected: rsResult.errorsCorrected,
-        errorReason: `CRC32 checksum mismatch (computed: 0x${computedCrc.toString(16)}, stored: 0x${storedCrc.toString(16)})`,
-      };
-      continue;
-    }
+      const version = data[4];
+      const payloadType = data[5] as PayloadType;
+      const ringCount = data[6];
+      const sectorCount = data[7];
+      const maskPattern = data[8];
+      const decodedEcc = data[9] as EccLevel;
+      const payloadLen = (data[10] << 8) | data[11];
 
-    // Decode UTF-8 payload
-    const decoder = new TextDecoder("utf-8");
-    const payloadStr = decoder.decode(data.slice(12, 12 + payloadLen));
+      const expectedTotalLen = 12 + payloadLen + 4; // header + payload + CRC
+      if (data.length < expectedTotalLen) {
+        bestStatus = RqrDiagnosticStatus.INSUFFICIENT_CAPACITY;
+        bestError = `Data length (${data.length} bytes) shorter than payload requirement (${expectedTotalLen} bytes)`;
+        continue;
+      }
 
-    return {
-      success: true,
-      packet: {
-        header: {
-          version,
-          payloadType,
-          ringCount,
-          sectorCount,
-          maskPattern,
-          eccLevel: decodedEcc,
-          payloadLength: payloadLen,
+      // Verify CRC32
+      const unchecksummed = data.slice(0, 12 + payloadLen);
+      const computedCrc = computeCRC32(unchecksummed);
+      const storedCrc = bytesToCRC32(data, 12 + payloadLen);
+
+      if (computedCrc !== storedCrc) {
+        bestStatus = RqrDiagnosticStatus.CHECKSUM_FAILED;
+        bestError = `CRC32 checksum mismatch (computed: 0x${computedCrc.toString(16)}, stored: 0x${storedCrc.toString(16)})`;
+        bestErrorsCorrected = rsResult.errorsCorrected;
+        continue;
+      }
+
+      // Decode UTF-8 payload
+      const decoder = new TextDecoder('utf-8');
+      const payloadStr = decoder.decode(data.slice(12, 12 + payloadLen));
+
+      return {
+        success: true,
+        packet: {
+          header: {
+            version,
+            payloadType,
+            ringCount,
+            sectorCount,
+            maskPattern,
+            eccLevel: decodedEcc,
+            payloadLength: payloadLen,
+          },
+          payload: payloadStr,
+          crc32: storedCrc,
         },
-        payload: payloadStr,
-        crc32: storedCrc,
-      },
-      errorsCorrected: rsResult.errorsCorrected,
-    };
+        errorsCorrected: rsResult.errorsCorrected,
+        status: RqrDiagnosticStatus.VALIDATED,
+      };
+    }
   }
 
-  return bestResult;
+  return {
+    success: false,
+    errorsCorrected: bestErrorsCorrected,
+    status: bestStatus,
+    errorReason: bestError,
+  };
 }
+

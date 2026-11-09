@@ -29,7 +29,8 @@ import {
   formatContentPayload,
   CONTENT_TYPE_MAP,
 } from '../core/contentTypes';
-import { encodeRqrPacket, EccLevel } from '../core/rqrProtocol';
+import { encodeRqrPacket, EccLevel, RqrDiagnosticStatus } from '../core/rqrProtocol';
+import { calculateGridCapacity, getRecommendedGridDimensions } from '../core/radialGeometry';
 import { STARTER_TEMPLATES } from '../data/templates';
 import { saveDesign, SavedDesign } from '../data/designStore';
 import {
@@ -41,6 +42,7 @@ import {
   ExportResolution,
   ValidationReport,
 } from '../core/exportEngine';
+
 import {
   QrCode,
   Sparkles,
@@ -142,18 +144,35 @@ export const GeneratorPage: React.FC<GeneratorPageProps> = ({ initialTemplateId 
     });
   }, [mode, formattedPayload, content.kind, ringCount, sectorCount, radialEccLevel]);
 
-  // Handle template selection
+  // Handle initial template selection
   useEffect(() => {
     if (initialTemplateId) {
       const t = STARTER_TEMPLATES.find((item) => item.id === initialTemplateId);
       if (t) {
         setMode(t.mode);
         setContent(t.defaultPayload);
+        if (t.ringCount) setRingCount(t.ringCount);
+        if (t.sectorCount) setSectorCount(t.sectorCount);
         if (t.radialStyle) setRadialStyle({ ...t.radialStyle });
         if (t.standardStyle) setStandardStyle({ ...t.standardStyle });
       }
     }
   }, [initialTemplateId]);
+
+  // Automatically adjust rings and sectors if payload exceeds current grid capacity
+  useEffect(() => {
+    if (mode !== 'radial') return;
+    const encoder = new TextEncoder();
+    const payloadBytes = encoder.encode(formattedPayload).length;
+    const requiredTotalBytes = 12 + payloadBytes + 4 + 12; // header + payload + CRC + ECC
+    const currentCap = calculateGridCapacity(ringCount, sectorCount).dataBytes;
+    if (requiredTotalBytes > currentCap) {
+      const recommended = getRecommendedGridDimensions(requiredTotalBytes);
+      setRingCount(recommended.ringCount);
+      setSectorCount(recommended.sectorCount);
+    }
+  }, [mode, formattedPayload, ringCount, sectorCount]);
+
 
   // Render to canvas
   const renderCode = useCallback(() => {
@@ -199,11 +218,13 @@ export const GeneratorPage: React.FC<GeneratorPageProps> = ({ initialTemplateId 
         if (active) {
           setValidationReport({
             isVerified: false,
+            status: RqrDiagnosticStatus.DECODING_FAILED,
             format: mode,
             originalPayload: formattedPayload,
             error: String(err),
           });
           setIsValidating(false);
+
         }
       }
     }, 400);
@@ -644,6 +665,9 @@ export const GeneratorPage: React.FC<GeneratorPageProps> = ({ initialTemplateId 
               <button
                 key={t.id}
                 onClick={() => {
+                  setContent(t.defaultPayload);
+                  if (t.ringCount) setRingCount(t.ringCount);
+                  if (t.sectorCount) setSectorCount(t.sectorCount);
                   if (t.radialStyle) setRadialStyle({ ...t.radialStyle });
                   if (t.standardStyle) setStandardStyle({ ...t.standardStyle });
                 }}
@@ -680,15 +704,59 @@ export const GeneratorPage: React.FC<GeneratorPageProps> = ({ initialTemplateId 
             ) : validationReport?.isVerified ? (
               <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 text-[11px] font-semibold border border-emerald-500/20">
                 <CheckCircle2 className="w-3.5 h-3.5" />
-                <span>Verified 100% Decodable</span>
+                <span>VALIDATED (100% Decodable)</span>
+              </span>
+            ) : validationReport?.status === RqrDiagnosticStatus.INSUFFICIENT_CAPACITY ? (
+              <span
+                className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-rose-500/10 text-rose-400 text-[11px] font-semibold border border-rose-500/20"
+                title={validationReport.error}
+              >
+                <AlertTriangle className="w-3.5 h-3.5" />
+                <span>INSUFFICIENT CAPACITY</span>
+              </span>
+            ) : validationReport?.status === RqrDiagnosticStatus.LOW_MODULE_RESOLUTION ? (
+              <span
+                className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-amber-500/10 text-amber-400 text-[11px] font-semibold border border-amber-500/20"
+                title={validationReport.error}
+              >
+                <AlertTriangle className="w-3.5 h-3.5" />
+                <span>LOW MODULE RESOLUTION</span>
+              </span>
+            ) : validationReport?.status === RqrDiagnosticStatus.STRUCTURAL_MARKER_ERROR ? (
+              <span
+                className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-orange-500/10 text-orange-400 text-[11px] font-semibold border border-orange-500/20"
+                title={validationReport.error}
+              >
+                <Crosshair className="w-3.5 h-3.5" />
+                <span>STRUCTURAL MARKER ERROR</span>
+              </span>
+            ) : validationReport?.status === RqrDiagnosticStatus.ERROR_CORRECTION_FAILED ? (
+              <span
+                className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-amber-500/10 text-amber-400 text-[11px] font-semibold border border-amber-500/20"
+                title={validationReport.error}
+              >
+                <ShieldAlert className="w-3.5 h-3.5" />
+                <span>ERROR CORRECTION FAILED</span>
+              </span>
+            ) : validationReport?.status === RqrDiagnosticStatus.CHECKSUM_FAILED ? (
+              <span
+                className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-purple-500/10 text-purple-400 text-[11px] font-semibold border border-purple-500/20"
+                title={validationReport.error}
+              >
+                <AlertTriangle className="w-3.5 h-3.5" />
+                <span>CHECKSUM FAILED</span>
               </span>
             ) : (
-              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-amber-500/10 text-amber-400 text-[11px] font-semibold border border-amber-500/20">
+              <span
+                className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-amber-500/10 text-amber-400 text-[11px] font-semibold border border-amber-500/20"
+                title={validationReport?.error}
+              >
                 <AlertTriangle className="w-3.5 h-3.5" />
-                <span>Decoding Warning: Check Density</span>
+                <span>DECODING FAILED</span>
               </span>
             )}
           </div>
+
 
           {/* Viewport Control Tools */}
           <div className="flex items-center gap-1.5">

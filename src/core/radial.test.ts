@@ -8,7 +8,14 @@ import assert from 'node:assert/strict';
 import { computeCRC32, crc32ToBytes, bytesToCRC32 } from './crc32';
 import { encodeRS, decodeRS, gfAdd, gfMul, gfDiv } from './reedsolomon';
 import { encodeRqrPacket, decodeRqrCodeword, PayloadType, EccLevel } from './rqrProtocol';
-import { buildRadialMatrix, extractBitsFromRadialMatrix, DEFAULT_GRID_CONFIG } from './radialGeometry';
+import {
+  buildRadialMatrix,
+  extractBitsFromRadialMatrix,
+  calculateGridCapacity,
+  getRecommendedGridDimensions,
+  DEFAULT_GRID_CONFIG,
+} from './radialGeometry';
+
 
 test('CRC32 computation & roundtrip byte conversion', () => {
   const encoder = new TextEncoder();
@@ -117,3 +124,68 @@ test('End-to-end radial grid bit mapping and unmasking', () => {
   assert.equal(decodeResult.success, true);
   assert.equal(decodeResult.packet?.payload, payload);
 });
+
+test('Dynamic capacity calculation & tier recommendation for large payloads', () => {
+  const shortText = 'https://radialqr.art';
+  const shortRec = getRecommendedGridDimensions(new TextEncoder().encode(shortText).length + 28);
+  assert.equal(shortRec.ringCount, 14);
+  assert.equal(shortRec.sectorCount, 44);
+
+  const longText = 'Enter the Labyrinth: Geometric data unlocked through radial coordinates.';
+  const longRec = getRecommendedGridDimensions(new TextEncoder().encode(longText).length + 28);
+  assert.ok(longRec.ringCount >= 18);
+  assert.ok(longRec.maxBytes >= 96);
+
+  const vCardPayload = 'BEGIN:VCARD\nVERSION:3.0\nN:Rostova;Elena\nORG:Prism Dynamics\nTEL:+15550199\nEMAIL:elena@radialqr.art\nEND:VCARD';
+  const vCardRec = getRecommendedGridDimensions(new TextEncoder().encode(vCardPayload).length + 28);
+  assert.ok(vCardRec.ringCount >= 20);
+  assert.ok(vCardRec.maxBytes >= 130);
+
+  const capacity = calculateGridCapacity(vCardRec.ringCount, vCardRec.sectorCount);
+  assert.ok(capacity.dataBytes >= vCardRec.maxBytes);
+});
+
+test('All 6 design families preserve deterministic RQR1 data coordinates', () => {
+  const testPayload = 'https://radialqr.art/gallery/all-six-families';
+  const families = [
+    'radial-angular',
+    'spiral-flow',
+    'circular-labyrinth',
+    'circuit-matrix',
+    'concentric-rings',
+    'abstract-hybrid',
+  ] as const;
+
+  const { bits, packet } = encodeRqrPacket(testPayload, PayloadType.URL, {
+    ringCount: 16,
+    sectorCount: 48,
+    eccLevel: EccLevel.MEDIUM,
+  });
+
+  for (const family of families) {
+    const spiralFactor = family === 'spiral-flow' ? 0.8 : 0;
+    const config = {
+      ...DEFAULT_GRID_CONFIG,
+      ringCount: 16,
+      sectorCount: 48,
+      spiralFactor,
+    };
+
+    const matrix = buildRadialMatrix(bits, config);
+    assert.equal(matrix.hasOverflow, false);
+
+    // Verify structural markers remain solid and unshifted
+    for (let s = 0; s < 48; s++) {
+      assert.equal(matrix.cells[0][s].type, 'CLOCK');
+      assert.equal(matrix.cells[15][s].type, 'BOUNDARY');
+    }
+
+    // Verify bits extract and decode back to exact payload
+    const extractedBytes = extractBitsFromRadialMatrix(matrix.cells, config);
+    const decoded = decodeRqrCodeword(extractedBytes);
+
+    assert.equal(decoded.success, true, `Decoding failed for family: ${family}`);
+    assert.equal(decoded.packet?.payload, testPayload, `Payload mismatch for family: ${family}`);
+  }
+});
+

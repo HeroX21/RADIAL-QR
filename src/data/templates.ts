@@ -12,10 +12,13 @@ export interface CodeTemplate {
   mode: 'radial' | 'standard';
   familyLabel: string;
   description: string;
+  ringCount?: number;
+  sectorCount?: number;
   radialStyle?: RadialStyleOptions;
   standardStyle?: StandardQrOptions;
   defaultPayload: ContentPayload;
 }
+
 
 export const STARTER_TEMPLATES: CodeTemplate[] = [
   {
@@ -24,6 +27,8 @@ export const STARTER_TEMPLATES: CodeTemplate[] = [
     mode: 'radial',
     familyLabel: 'Radial Angular',
     description: 'Dense concentric geometric segments inspired by radar & optics. Maximum contrast & high density.',
+    ringCount: 16,
+    sectorCount: 48,
     radialStyle: {
       ...DEFAULT_STYLE_OPTIONS,
       family: 'radial-angular',
@@ -49,10 +54,13 @@ export const STARTER_TEMPLATES: CodeTemplate[] = [
     mode: 'radial',
     familyLabel: 'Spiral Flow',
     description: 'Archimedean spiral data arrangement with dynamic swirling angular sweeps.',
+    ringCount: 16,
+    sectorCount: 48,
     radialStyle: {
       ...DEFAULT_STYLE_OPTIONS,
       family: 'spiral-flow',
       moduleShape: 'wedge',
+      spiralFactor: 0.8,
       fgColor: '#F59E0B',
       fgColorEnd: '#EF4444',
       bgColor: '#090B10',
@@ -74,6 +82,8 @@ export const STARTER_TEMPLATES: CodeTemplate[] = [
     mode: 'radial',
     familyLabel: 'Circular Labyrinth',
     description: 'Maze-like concentric corridors and orthogonal connecting bridges.',
+    ringCount: 20,
+    sectorCount: 60,
     radialStyle: {
       ...DEFAULT_STYLE_OPTIONS,
       family: 'circular-labyrinth',
@@ -99,6 +109,8 @@ export const STARTER_TEMPLATES: CodeTemplate[] = [
     mode: 'radial',
     familyLabel: 'Circuit Matrix',
     description: 'Futuristic electronic PCB board aesthetics with radial traces and terminal via pads.',
+    ringCount: 18,
+    sectorCount: 54,
     radialStyle: {
       ...DEFAULT_STYLE_OPTIONS,
       family: 'circuit-matrix',
@@ -130,6 +142,8 @@ export const STARTER_TEMPLATES: CodeTemplate[] = [
     mode: 'radial',
     familyLabel: 'Concentric Rings',
     description: 'Crisp layered circular arc bands and monochromatic luxury aesthetic.',
+    ringCount: 16,
+    sectorCount: 48,
     radialStyle: {
       ...DEFAULT_STYLE_OPTIONS,
       family: 'concentric-rings',
@@ -155,6 +169,8 @@ export const STARTER_TEMPLATES: CodeTemplate[] = [
     mode: 'radial',
     familyLabel: 'Abstract Hybrid',
     description: 'Faceted diamond polygons, angular experimental geometry and jewel cuts.',
+    ringCount: 24,
+    sectorCount: 72,
     radialStyle: {
       ...DEFAULT_STYLE_OPTIONS,
       family: 'abstract-hybrid',
@@ -183,6 +199,7 @@ export const STARTER_TEMPLATES: CodeTemplate[] = [
       },
     },
   },
+
   // Standard QR Presets
   {
     id: 'obsidian-minimal',
